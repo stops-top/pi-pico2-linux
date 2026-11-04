@@ -27,7 +27,7 @@
 #include "string_local.h"
 #endif
 
-#define LED_PIN			2
+#define LED_PIN			25		/* this board wires the GPIO LED to GP25 */
 #define RP2350_XIP_CSI_PIN	19
 
 #define PSRAM_LOCATION (0x11000000U)

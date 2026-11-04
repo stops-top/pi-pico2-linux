@@ -1,0 +1,208 @@
+Subject: [PATCH] rp2350: do bitops/atomics as interrupt-masked RMW
+
+The RP2350 XIP/QSPI window does not execute AMO instructions: every one of
+them raises a store access fault and would be emulated in the trap handler
+(816 AMOs in this rv32 nommu build). Hazard3 is single core and in-order, so
+masking interrupts around a read-modify-write is equivalent here, and far
+cheaper than a trap per atomic. This mirrors what 0003 already does for the
+lr/sc sequences, but keeps the access uninterruptible instead of bare lw/sw.
+
+Remaining AMOs: five in futex_wake_op() (asm/futex.h), still emulated.
+---
+--- a/arch/riscv/include/asm/bitops.h	2025-05-26 07:09:23.000000000 +0800
++++ b/arch/riscv/include/asm/bitops.h	2026-11-04 14:26:46.930971472 +0800
+@@ -185,32 +185,41 @@
+ 
+ #include <asm-generic/bitops/const_hweight.h>
+ 
+-#if (BITS_PER_LONG == 64)
+-#define __AMO(op)	"amo" #op ".d"
+-#elif (BITS_PER_LONG == 32)
+-#define __AMO(op)	"amo" #op ".w"
+-#else
+-#error "Unexpected BITS_PER_LONG"
+-#endif
++/*
++ * The RP2350 QSPI/XIP path does not execute AMO instructions: they raise a store
++ * access fault and would be emulated in the trap handler, one trap per atomic.
++ * Hazard3 is single core and in-order, so an interrupt-masked read-modify-write
++ * is equivalent here (and is what the accompanying lr/sc -> lw/sw patch already
++ * does for the ordered ops, except that a bare lw/sw can be interrupted).
++ */
++#define __bitop_apply_and(x, v)		((x) & (v))
++#define __bitop_apply_or(x, v)		((x) | (v))
++#define __bitop_apply_xor(x, v)		((x) ^ (v))
+ 
+ #define __test_and_op_bit_ord(op, mod, nr, addr, ord)		\
+ ({								\
+-	unsigned long __res, __mask;				\
+-	__mask = BIT_MASK(nr);					\
+-	__asm__ __volatile__ (					\
+-		__AMO(op) #ord " %0, %2, %1"			\
+-		: "=r" (__res), "+A" (addr[BIT_WORD(nr)])	\
+-		: "r" (mod(__mask))				\
+-		: "memory");					\
++	unsigned long *__p = &(addr)[BIT_WORD(nr)];		\
++	unsigned long __mask = BIT_MASK(nr);			\
++	unsigned long __val = mod(__mask);			\
++	unsigned long __res, __flags;				\
++								\
++	__flags = arch_local_irq_save();			\
++	__res = READ_ONCE(*__p);				\
++	WRITE_ONCE(*__p, __bitop_apply_##op(__res, __val));	\
++	arch_local_irq_restore(__flags);			\
+ 	((__res & __mask) != 0);				\
+ })
+ 
+ #define __op_bit_ord(op, mod, nr, addr, ord)			\
+-	__asm__ __volatile__ (					\
+-		__AMO(op) #ord " zero, %1, %0"			\
+-		: "+A" (addr[BIT_WORD(nr)])			\
+-		: "r" (mod(BIT_MASK(nr)))			\
+-		: "memory");
++do {								\
++	unsigned long *__p = &(addr)[BIT_WORD(nr)];		\
++	unsigned long __val = mod(BIT_MASK(nr));		\
++	unsigned long __flags;					\
++								\
++	__flags = arch_local_irq_save();			\
++	WRITE_ONCE(*__p, __bitop_apply_##op(READ_ONCE(*__p), __val)); \
++	arch_local_irq_restore(__flags);			\
++} while (0)
+ 
+ #define __test_and_op_bit(op, mod, nr, addr) 			\
+ 	__test_and_op_bit_ord(op, mod, nr, addr, .aqrl)
+@@ -354,12 +363,13 @@
+ static __always_inline bool arch_xor_unlock_is_negative_byte(unsigned long mask,
+ 		volatile unsigned long *addr)
+ {
+-	unsigned long res;
+-	__asm__ __volatile__ (
+-		__AMO(xor) ".rl %0, %2, %1"
+-		: "=r" (res), "+A" (*addr)
+-		: "r" (__NOP(mask))
+-		: "memory");
++	unsigned long res, flags;
++
++	flags = arch_local_irq_save();
++	res = READ_ONCE(*addr);
++	WRITE_ONCE(*addr, __bitop_apply_xor(res, __NOP(mask)));
++	arch_local_irq_restore(flags);
++
+ 	return (res & BIT(7)) != 0;
+ }
+ 
+@@ -367,7 +377,9 @@
+ #undef __op_bit
+ #undef __NOP
+ #undef __NOT
+-#undef __AMO
++#undef __bitop_apply_and
++#undef __bitop_apply_or
++#undef __bitop_apply_xor
+ 
+ #include <asm-generic/bitops/instrumented-atomic.h>
+ #include <asm-generic/bitops/instrumented-lock.h>
+--- a/arch/riscv/include/asm/atomic.h	2026-11-04 14:31:06.501884503 +0800
++++ b/arch/riscv/include/asm/atomic.h	2026-11-04 14:28:12.564382283 +0800
+@@ -50,15 +50,24 @@
+  * have the AQ or RL bits set.  These don't return anything, so there's only
+  * one version to worry about.
+  */
++/*
++ * See the comment in asm/bitops.h: AMOs fault on the RP2350 XIP window and would
++ * each be emulated through the trap handler, so use an interrupt-masked
++ * read-modify-write instead (single core, in-order Hazard3).
++ */
++#define __atomic_apply_add(x, I)	((x) + (I))
++#define __atomic_apply_and(x, I)	((x) & (I))
++#define __atomic_apply_or(x, I)		((x) | (I))
++#define __atomic_apply_xor(x, I)	((x) ^ (I))
++
+ #define ATOMIC_OP(op, asm_op, I, asm_type, c_type, prefix)		\
+ static __always_inline							\
+-void arch_atomic##prefix##_##op(c_type i, atomic##prefix##_t *v)	\
++void arch_atomic##prefix##_##op(c_type i, atomic##prefix##_t *v)		\
+ {									\
+-	__asm__ __volatile__ (						\
+-		"	amo" #asm_op "." #asm_type " zero, %1, %0"	\
+-		: "+A" (v->counter)					\
+-		: "r" (I)						\
+-		: "memory");						\
++	unsigned long flags;						\
++	flags = arch_local_irq_save();					\
++	WRITE_ONCE(v->counter, __atomic_apply_##asm_op(READ_ONCE(v->counter), I)); \
++	arch_local_irq_restore(flags);					\
+ }									\
+ 
+ #ifdef CONFIG_GENERIC_ATOMIC64
+@@ -90,23 +99,17 @@
+ 					     atomic##prefix##_t *v)	\
+ {									\
+ 	register c_type ret;						\
+-	__asm__ __volatile__ (						\
+-		"	amo" #asm_op "." #asm_type " %1, %2, %0"	\
+-		: "+A" (v->counter), "=r" (ret)				\
+-		: "r" (I)						\
+-		: "memory");						\
++	unsigned long flags;						\
++	flags = arch_local_irq_save();					\
++	ret = READ_ONCE(v->counter);					\
++	WRITE_ONCE(v->counter, __atomic_apply_##asm_op(ret, I));		\
++	arch_local_irq_restore(flags);					\
+ 	return ret;							\
+ }									\
+ static __always_inline							\
+ c_type arch_atomic##prefix##_fetch_##op(c_type i, atomic##prefix##_t *v)	\
+ {									\
+-	register c_type ret;						\
+-	__asm__ __volatile__ (						\
+-		"	amo" #asm_op "." #asm_type ".aqrl  %1, %2, %0"	\
+-		: "+A" (v->counter), "=r" (ret)				\
+-		: "r" (I)						\
+-		: "memory");						\
+-	return ret;							\
++	return arch_atomic##prefix##_fetch_##op##_relaxed(i, v);		\
+ }
+ 
+ #define ATOMIC_OP_RETURN(op, asm_op, c_op, I, asm_type, c_type, prefix)	\
+--- a/arch/riscv/include/asm/cmpxchg.h	2026-11-04 14:31:06.501884503 +0800
++++ b/arch/riscv/include/asm/cmpxchg.h	2026-11-04 14:29:41.511809844 +0800
+@@ -7,12 +7,14 @@
+ #define _ASM_RISCV_CMPXCHG_H
+ 
+ #include <linux/bug.h>
++#include <linux/compiler.h>
+ 
+ #include <asm/alternative-macros.h>
+ #include <asm/fence.h>
+ #include <asm/hwcap.h>
+ #include <asm/insn-def.h>
+ #include <asm/cpufeature-macros.h>
++#include <asm/irqflags.h>
+ 
+ #define __arch_xchg_masked(sc_sfx, swap_sfx, prepend, sc_append,		\
+ 			   swap_append, r, p, n)				\
+@@ -52,13 +54,15 @@
+ 
+ #define __arch_xchg(sfx, prepend, append, r, p, n)			\
+ ({									\
+-	__asm__ __volatile__ (						\
+-		prepend							\
+-		"	amoswap" sfx " %0, %2, %1\n"			\
+-		append							\
+-		: "=r" (r), "+A" (*(p))					\
+-		: "r" (n)						\
+-		: "memory");						\
++	volatile typeof(*(p)) *__p = (p);				\
++	unsigned long flags;						\
++									\
++	__asm__ __volatile__ ("" prepend ::: "memory");			\
++	flags = arch_local_irq_save();					\
++	r = READ_ONCE(*__p);						\
++	WRITE_ONCE(*__p, n);						\
++	arch_local_irq_restore(flags);					\
++	__asm__ __volatile__ ("" append ::: "memory");			\
+ })
+ 
+ #define _arch_xchg(ptr, new, sc_sfx, swap_sfx, prepend,			\
