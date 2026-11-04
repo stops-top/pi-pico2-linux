@@ -1,0 +1,4 @@
+{
+    "cmake.sourceDirectory": "/root/pi-pico2-linux/package/pico2-bootloader/bootloader",
+    "cmake.autoDetectSourceDirectory": false
+}
