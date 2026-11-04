@@ -84,6 +84,7 @@ $(BUILD_DIR)/$(PROGRAM).uf2: $(BUILD_DIR)/$(PROGRAM).elf
 
 $(BUILD_DIR)/$(PROGRAM).bin: $(BUILD_DIR)/$(PROGRAM).elf
 	$(OBJCOPY) -O binary $< $@
+	truncate -s %16 $@
 
 # Dummy payload file so we won't get errors if it doesn't exist
 payload.bin:

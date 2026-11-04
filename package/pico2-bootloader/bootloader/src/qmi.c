@@ -13,12 +13,15 @@
 #include "linux/irqflags.h"
 
 #define XIP_CTRL_CTRL			0
+#define XIP_CTRL_EN_SECURE		BIT(0)
+#define XIP_CTRL_EN_NONSECURE		BIT(1)
 #define XIP_CTRL_WRITABLE_M1_BITS	BIT(11)
 
 #define QMI_DIRECT_CSR			0
 #define QMI_DIRECT_CSR_CLKDIV_LSB	22
 #define QMI_DIRECT_CSR_EN_BITS		BIT(0)
 #define QMI_DIRECT_CSR_BUSY_BITS	BIT(1)
+#define QMI_DIRECT_CSR_ASSERT_CS0N_BITS	BIT(2)
 #define QMI_DIRECT_CSR_ASSERT_CS1N_BITS	BIT(3)
 #define QMI_DIRECT_CSR_TXEMPTY_BITS	BIT(11)
 
@@ -28,6 +31,28 @@
 #define QMI_DIRECT_TX_IWIDTH_VALUE_Q	0x2
 
 #define QMI_DIRECT_RX			2
+
+#define QMI_M0_TIMING			(0x0c/4)
+#define QMI_M0_RFMT			(0x10/4)
+#define QMI_M0_RCMD			(0x14/4)
+#define QMI_ATRANS0			(0x34/4)
+
+#define QMI_M0_MAX_SELECT_LSB		17
+#define QMI_M0_MIN_DESELECT_LSB		12
+#define QMI_M0_RXDELAY_LSB		8
+#define QMI_M0_CLKDIV_LSB		0
+
+/* Read: 8-bit single-width command prefix, 24-bit single address, single data,
+ * no dummy, no suffix -- i.e. a plain 03h read re-issued on every transaction. */
+#define QMI_M0_RFMT_SINGLE_READ							\
+	(0x0 << 1 |					/* PREFIX_WIDTH  = single */	\
+	 0x0 << 3 |					/* ADDR_WIDTH    = single */	\
+	 0x0 << 5 |					/* SUFFIX_WIDTH  = single */	\
+	 0x0 << 7 |					/* DUMMY_WIDTH   = single */	\
+	 0x0 << 9 |					/* DATA_WIDTH    = single */	\
+	 0x1 << 12 |					/* PREFIX_LEN    = 8 bits */	\
+	 0x0 << 14 |					/* SUFFIX_LEN    = none */	\
+	 0x0 << 16)					/* DUMMY_LEN     = none */
 
 #define QMI_M1_TIMING			(0x20/4)
 #define QMI_M1_TIMING_PAGEBREAK_LSB	28
@@ -191,7 +216,8 @@ size_t setup_psram(void)
 	XIP_QMI_BASE[QMI_M1_TIMING] =
 		QMI_M1_TIMING_PAGEBREAK_VALUE_1024 << QMI_M1_TIMING_PAGEBREAK_LSB | // Break between pages.
 		3 << QMI_M1_TIMING_SELECT_HOLD_LSB | // Delay releasing CS for 3 extra system cycles.
-		1 << QMI_M1_TIMING_COOLDOWN_LSB | 1 << QMI_M1_TIMING_RXDELAY_LSB |
+		1 << QMI_M1_TIMING_COOLDOWN_LSB |
+		2 << QMI_M1_TIMING_RXDELAY_LSB |
 		16 << QMI_M1_TIMING_MAX_SELECT_LSB |  // In units of 64 system clock cycles. PSRAM says 8us max. 8 / 0.00752 /64
 											  // = 16.62
 		7 << QMI_M1_TIMING_MIN_DESELECT_LSB | // In units of system clock cycles. PSRAM says 50ns.50 / 7.52 = 6.64
@@ -225,9 +251,58 @@ size_t setup_psram(void)
 		psram_size *= 4;
 
 	// Mark that we can write to PSRAM.
-	XIP_CTRL_BASE[XIP_CTRL_WRITABLE_M1_BITS] |= XIP_CTRL_WRITABLE_M1_BITS;
-	//arch_local_irq_write(intr_stash);
+	XIP_CTRL_BASE[XIP_CTRL_CTRL] |= XIP_CTRL_WRITABLE_M1_BITS;
+
 	printf("PSRAM ID: %x %x\n", kgd, eid);
 
 	return psram_size;
+}
+
+/*
+ * The bootrom leaves CS0 asserted between XIP transfers (M0 MAX_SELECT resets to
+ * 0, which lets the QMI hold a chip select low indefinitely), so the flash sits
+ * in continuous-read mode. SCK and the data pins are shared with the PSRAM on
+ * CS1, so every PSRAM transfer clocks a flash whose CS0 is still low: the flash
+ * loses track of the continuous read and all later flash reads return zeroes.
+ * Reset the flash and drive it with plain 03h reads that deassert CS0 after
+ * every transfer, so the two devices can be accessed alternately.
+ */
+static void direct_cs0_cmd(uint8_t cmd) {
+	XIP_QMI_BASE[QMI_DIRECT_CSR] = 30 << QMI_DIRECT_CSR_CLKDIV_LSB | QMI_DIRECT_CSR_EN_BITS;
+	while ((XIP_QMI_BASE[QMI_DIRECT_CSR] & QMI_DIRECT_CSR_BUSY_BITS) != 0)
+		;
+
+	XIP_QMI_BASE[QMI_DIRECT_CSR] |= QMI_DIRECT_CSR_ASSERT_CS0N_BITS;
+	XIP_QMI_BASE[QMI_DIRECT_TX] = QMI_DIRECT_TX_OE_BITS | cmd;
+	while ((XIP_QMI_BASE[QMI_DIRECT_CSR] & QMI_DIRECT_CSR_BUSY_BITS) != 0)
+		;
+	XIP_QMI_BASE[QMI_DIRECT_CSR] &= ~QMI_DIRECT_CSR_ASSERT_CS0N_BITS;
+	(void)XIP_QMI_BASE[QMI_DIRECT_RX];
+
+	XIP_QMI_BASE[QMI_DIRECT_CSR] &= ~QMI_DIRECT_CSR_EN_BITS;
+}
+
+void flash_serial_mode(void) {
+	direct_cs0_cmd(0xff);	/* terminate any continuous read */
+	direct_cs0_cmd(0x66);	/* reset enable */
+	direct_cs0_cmd(0x99);	/* device reset: single-SPI, 3-byte addresses */
+	delay(3000);		/* tRSF recovery time */
+
+	XIP_QMI_BASE[QMI_M0_TIMING] =
+		1 << 30 |				/* COOLDOWN */
+		3 << 23 |				/* SELECT_HOLD */
+		1 << QMI_M0_MAX_SELECT_LSB |		/* drop CS0 once the transfer is done */
+		7 << QMI_M0_MIN_DESELECT_LSB |
+		3 << QMI_M0_RXDELAY_LSB |
+		4 << QMI_M0_CLKDIV_LSB;			/* 150MHz / 4 = 37.5MHz SCK */
+	XIP_QMI_BASE[QMI_M0_RFMT] = QMI_M0_RFMT_SINGLE_READ;
+	XIP_QMI_BASE[QMI_M0_RCMD] = 0x03;
+}
+
+void xip_cache_set(int enable) {
+	if (enable)
+		XIP_CTRL_BASE[XIP_CTRL_CTRL] |= XIP_CTRL_EN_SECURE | XIP_CTRL_EN_NONSECURE;
+	else
+		XIP_CTRL_BASE[XIP_CTRL_CTRL] &= ~(XIP_CTRL_EN_SECURE | XIP_CTRL_EN_NONSECURE);
+	mb();
 }

@@ -10,25 +10,23 @@
 		bootargs = "earlycon=pl011,mmio32,0x40070000 console=ttyAMA0 root=mtd:cramfs rootfstype=cramfs ro";
 	};
 
-	flash@10000000 {
-		compatible = "phram"; /* ROM mapped into physical address space */
-		/* reg = <0x10000000  0x800000>; */  /* 8MB Flash Base & Size */
-		reg = <0x10000000 0x1000000>;        /* 16MB Flash Base & Size */
+	/*
+	 * Reading the QSPI window while executing from PSRAM makes the shared
+	 * QSPI bus switch chip selects constantly, so the bootloader copies the
+	 * rootfs into PSRAM and the kernel never touches flash again.
+	 */
+	rootfs@11700000 {
+		compatible = "phram";
+		reg = <0x11700000 0x80000>;	/* 512KB cramfs copied from flash +2MB */
 
 		partitions {
 			#address-cells = <1>;
 			#size-cells = <1>;
 			compatible = "fixed-partitions";
 
-			/* partition@0 {
-				label = "kernel";
-				reg = <0x0 0x200000>;
-				read-only;
-			}; */
-
-			partition@600000 {
+			partition@0 {
 				label = "cramfs";
-				reg = <0x600000 0x200000>; /* ~2MB for cramfs at 6MB offset*/
+				reg = <0x0 0x80000>;
 				read-only;
 			};
 		};
@@ -36,7 +34,7 @@
 
 	memory@11000000 {
 		device_type = "memory";
-		reg = <0x11000000 0x800000>;	/* 8MB */
+		reg = <0x11000000 0x700000>;	/* 7MB; 0x11700000 = rootfs, 0x11780000 = DTB */
 	};
 
 	cpus {

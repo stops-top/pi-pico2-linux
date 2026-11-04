@@ -16,29 +16,24 @@ _reloc:
 	jal	ra, _copy
 	la	a0, __bss_start
 	la	a1, __bss_end
-	mv	a2, x0
 	jal	ra, _set
 	call	_entry
 
 _set:
-	blt	a0, a1, ._set_loop
-	ret
-._set_loop:
-	sw	a0, (a2)
-	addi	a2, a2, 4
-	bge	a1, a0, ._set_loop
-	ret
+	bge	a0, a1, 2f
+1:	sw	x0, (a0)
+	addi	a0, a0, 4
+	blt	a0, a1, 1b
+2:	ret
 
 _copy:
-	blt	a0, a1, ._copy_loop
-	ret
-._copy_loop:
-	lw	a3, (a2)
+	bge	a0, a1, 2f
+1:	lw	a3, (a2)
 	addi	a2, a2, 4
 	sw	a3, (a0)
 	addi	a0, a0, 4
-	bge	a1, a0, ._copy_loop
-	ret
+	blt	a0, a1, 1b
+2:	ret
 
 .section .text, "ax"
 .global main

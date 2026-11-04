@@ -31,6 +31,18 @@
 #define RP2350_XIP_CSI_PIN	19
 
 #define PSRAM_LOCATION (0x11000000U)
+#define PSRAM_ROOTFS_ADDR	0x11700000U
+#define PSRAM_DTB_ADDR		0x11780000U
+#define ROOTFS_MAX_SIZE		0x80000U
+/* genimage.cfg places the cramfs partition at flash offset 2M. */
+#define FLASH_ROOTFS_ADDR	(0x10000000U + 0x200000U)
+#define CRAMFS_MAGIC		0x28cd3d45U
+
+/* Cached XIP windows (0x10/0x11..) plus 4MB select their uncached,
+ * non-allocating mirrors: 0x14 (flash) and 0x15 (PSRAM). */
+#define XIP_UNCACHED_OFFSET	0x04000000U
+
+#define to_uncached(p)		((void *)(((uintptr_t)(p)) | XIP_UNCACHED_OFFSET))
 
 /* Linker variable for the end of binary image */
 #ifdef PICO_SDK
@@ -50,19 +62,128 @@ static inline void set_uart0_pinmux(void);
 static inline void set_xip_cs1_pinmux(void);
 
 static int wait_for_input(const char *msg);
-static void hexdump(const void *data, size_t size);
-
 static inline const void* get_payload_start_address(void);
 static int psram_setup_and_test(size_t *psram_size);
 static int test_executability(void* addr);
 static void jump_to_kernel(void *ram_addr, const void *data_addr);
+static int copy_words(void *dst, const void *src, size_t len);
+
+/* Flash reads and PSRAM writes must not interleave inside one burst, so stage
+ * the copy through SRAM in chunks. */
+#define COPY_CHUNK_WORDS	1024
+static uint32_t copy_buf[COPY_CHUNK_WORDS] __attribute__((aligned(16)));
+static uint32_t check_buf[COPY_CHUNK_WORDS] __attribute__((aligned(16)));
+
+static int copy_words(void *dst, const void *src, size_t len) {
+	volatile uint32_t *d = (volatile uint32_t *)dst;
+	const volatile uint32_t *s = (const volatile uint32_t *)src;
+	size_t words = len >> 2, done, i;
+	uint32_t sum_src = 0, sum_dst = 0;
+
+	for (done = 0; done < words; done += i) {
+		size_t n = words - done < COPY_CHUNK_WORDS ? words - done : COPY_CHUNK_WORDS;
+		int pass;
+
+		/* The first CS0 transfer after a run of CS1 writes comes back as
+		 * zero, so prime the bus and require two matching reads. */
+		for (pass = 0; pass < 4; pass++) {
+			size_t diff = 0;
+
+			(void)s[done];
+			for (i = 0; i < n; i++)
+				copy_buf[i] = s[done + i];
+			for (i = 0; i < n; i++) {
+				check_buf[i] = s[done + i];
+				if (check_buf[i] != copy_buf[i])
+					diff++;
+			}
+			if (!diff)
+				break;
+		}
+		if (pass == 4) {
+			printf("\rflash reads unstable at word 0x%x\n", (unsigned int)done);
+			return -1;
+		}
+
+		for (i = 0; i < n; i++) {
+			d[done + i] = copy_buf[i];
+			sum_src += copy_buf[i];
+		}
+		for (i = 0; i < n; i++) {
+			uint32_t v = d[done + i];
+
+			if (v != copy_buf[i]) {
+				printf("\rpsram word 0x%x: wrote %08x read %08x\n",
+				       (unsigned int)(done + i) * 4, copy_buf[i], v);
+				return -1;
+			}
+			sum_dst += v;
+		}
+	}
+
+	return sum_src == sum_dst ? 0 : -1;
+}
+
+/* Emits "!c<mcause> e<mepc> v<mtval> i<instruction>" over UART0, then halts.
+ * Naked and register-only: the stack may be what faulted. */
+static void __attribute__((naked, aligned(4))) dbg_trap(void)
+{
+	__asm__ volatile (
+		"li   t5, 0x40070000\n"
+		"li   t4, 33\n"
+		"call .Ldbg_putc\n"
+		"csrr t1, mcause\n"
+		"li   t4, 99\n"
+		"call .Ldbg_putc\n"
+		"call .Ldbg_puthex\n"
+		"csrr t1, mepc\n"
+		"li   t4, 101\n"
+		"call .Ldbg_putc\n"
+		"call .Ldbg_puthex\n"
+		"csrr t1, mtval\n"
+		"li   t4, 118\n"
+		"call .Ldbg_putc\n"
+		"call .Ldbg_puthex\n"
+		"csrr t3, mepc\n"
+		"lw   t1, 0(t3)\n"
+		"li   t4, 105\n"
+		"call .Ldbg_putc\n"
+		"call .Ldbg_puthex\n"
+		"7: wfi\n"
+		"j 7b\n"
+		".Ldbg_putc:\n"
+		"1: lw   t6, 24(t5)\n"
+		"   andi t6, t6, 32\n"
+		"   bnez t6, 1b\n"
+		"   sb   t4, 0(t5)\n"
+		"   ret\n"
+		".Ldbg_puthex:\n"
+		"   li   t2, 28\n"
+		"2: srl  t3, t1, t2\n"
+		"   andi t3, t3, 15\n"
+		"   li   t0, 10\n"
+		"   blt  t3, t0, 3f\n"
+		"   addi t3, t3, 87\n"
+		"   j    4f\n"
+		"3: addi t3, t3, 48\n"
+		"4: mv   t4, t3\n"
+		"   lw   t6, 24(t5)\n"
+		"   andi t6, t6, 32\n"
+		"   bnez t6, 4b\n"
+		"   sb   t4, 0(t5)\n"
+		"   addi t2, t2, -4\n"
+		"   bge  t2, x0, 2b\n"
+		"   ret\n"
+	);
+}
 
 int main(void) {
 	int ret = 0;
-	uint32_t jump_ret, data;
+	uint32_t jump_ret, data, cramfs_magic, rootfs_size;
 	size_t device_tree_size, psram_size, kernel_size = 0;
 	void *ram_addr = (void *)PSRAM_LOCATION;
 	const void *data_addr;
+	const void *kernel_src;
 
 #ifdef PICO_SDK
 	stdio_init_all();
@@ -96,42 +217,83 @@ int main(void) {
 #endif
 
 	puts("\n\n\nRP2350 Bootloader starting...\n");
+	xip_cache_set(0);
 	ret = psram_setup_and_test(&psram_size);
 	if (ret)
 		goto exit;
 
+	flash_serial_mode();
+
 	data_addr = get_payload_start_address();
+	kernel_src = NULL;
 	if (!data_addr) {
 		printf("Failed to get ROM address is invalid\n");
 		goto exit;
 	}
 
-	printf("\nRom dump:\n");
-	hexdump(data_addr, 0x20);
-
 	device_tree_size = get_devicetree_size(data_addr);
+	kernel_src = (const void *)size_ceil((size_t)data_addr + device_tree_size, 0x10);
 
 	if (device_tree_size) {
-		kernel_size = get_kernel_size(data_addr + device_tree_size);
+		kernel_size = get_kernel_size(kernel_src);
 		if(!kernel_size)
 			printf("Kernel not found.\n");
 	} else {
 		printf("Device Tree not found.\n");
 	}
 
-	if ((device_tree_size + kernel_size) > psram_size) {
+	if (kernel_size && (PSRAM_LOCATION + kernel_size > PSRAM_ROOTFS_ADDR)) {
+		printf("Kernel end 0x%08x overlaps the PSRAM rootfs at 0x%08x\n",
+		       (unsigned int)(PSRAM_LOCATION + kernel_size), PSRAM_ROOTFS_ADDR);
+		goto exit;
+	}
+
+	if ((device_tree_size + kernel_size + ROOTFS_MAX_SIZE) > psram_size) {
 		printf("Data size 0x%04x is larger than PSRAM size 0x%04x\n",
 		       (device_tree_size + kernel_size), psram_size);
 		goto exit;
 	}
 
-	printf("\nCoping Kernel to RAM...");
-	memcpy(ram_addr, data_addr + device_tree_size, kernel_size);
-	printf("\rRam dump:              \n");
-	hexdump(ram_addr, 0x20);
+	cramfs_magic = *(const volatile uint32_t *)to_uncached((const void *)FLASH_ROOTFS_ADDR);
+	if (cramfs_magic != CRAMFS_MAGIC) {
+		printf("Bad cramfs magic 0x%08x at 0x%08x\n", cramfs_magic, FLASH_ROOTFS_ADDR);
+		goto exit;
+	}
+	rootfs_size = size_ceil(*(const volatile uint32_t *)
+				to_uncached((const void *)(FLASH_ROOTFS_ADDR + 4)), 0x10);
+	if (rootfs_size > ROOTFS_MAX_SIZE) {
+		printf("cramfs is 0x%x bytes, partition only holds 0x%x\n",
+		       rootfs_size, ROOTFS_MAX_SIZE);
+		goto exit;
+	}
+
+	printf("\rCopying DTB (%u bytes) to 0x%08x...",
+	       (unsigned int)device_tree_size, PSRAM_DTB_ADDR);
+	if (copy_words(to_uncached((void *)PSRAM_DTB_ADDR), to_uncached(data_addr),
+		       size_ceil(device_tree_size, 0x10))) {
+		puts(" DTB copy failed");
+		goto exit;
+	}
+	puts(" ok");
+
+	printf("Copying rootfs (%u bytes) to 0x%08x...", rootfs_size, PSRAM_ROOTFS_ADDR);
+	if (copy_words(to_uncached((void *)PSRAM_ROOTFS_ADDR),
+		       to_uncached((void *)FLASH_ROOTFS_ADDR), rootfs_size)) {
+		puts(" rootfs copy failed");
+		goto exit;
+	}
+	puts(" ok");
+
+	printf("Copying kernel (%u bytes) to 0x%08x...",
+	       (unsigned int)kernel_size, (unsigned int)PSRAM_LOCATION);
+	if (copy_words(to_uncached(ram_addr), to_uncached(kernel_src), kernel_size)) {
+		puts(" kernel copy failed");
+		goto exit;
+	}
+	puts(" ok");
 
 	if (kernel_size)
-		jump_to_kernel(ram_addr, data_addr);
+		jump_to_kernel(ram_addr, (const void *)PSRAM_DTB_ADDR);
 
 	ret = wait_for_input("Press y to jump to PSRAM...\r");
 	if (ret == 'y' || ret == 'Y') {
@@ -218,8 +380,7 @@ static int test_executability(void* addr) {
 	*addr_ptr = ret_inst;
 	mb();
 
-	printf("Jumping to 0x%08x, aligned from 0x%08x\n", addr_aligned, (size_t)addr);
-	printf("Function pointers: 0x%02x 0x%02x\n", ((uint8_t*)addr_ptr)[0], ((uint8_t*)addr_ptr)[1]);
+	printf("PSRAM executes at 0x%08x\n", addr_aligned);
 
 	if (*addr_ptr != ret_inst) {
 		printf("ERROR: Expected 0x%04x, got 0x%04x\n", ret_inst, *addr_ptr);
@@ -235,32 +396,13 @@ static void jump_to_kernel(void *ram_addr, const void *data_addr) {
 	typedef void (*image_entry_arg_t)(unsigned long hart, const void *dtb);
 	image_entry_arg_t image_entry = (image_entry_arg_t)ram_addr;
 
-	printf("\nJumping to kernel at 0x%08x and DT at 0x%08x\n", ram_addr, data_addr);
-	printf("If you are using USB serial, please connect over the hardware serial port.\n");
+	printf("Jumping to kernel at 0x%08x, DT at 0x%08x\n", ram_addr, data_addr);
+	/* Nothing but the PSRAM window is touched at runtime (kernel, DTB and rootfs
+	 * all live there), so no cross-device cache lines can alias; the cache has
+	 * been off for the whole copy, so there are no stale or dirty lines either.
+	 */
+	xip_cache_set(1);
+	SIO_BASE[0x28/4] = BIT(LED_PIN); /* LED on: handing over to the kernel */
+	__asm__ volatile ("csrw mtvec, %0" :: "r" (dbg_trap));
 	image_entry(0, data_addr);
-}
-
-static void hexdump(const void *data, size_t size) {
-	const uint8_t *data_ptr = (const uint8_t *)data;
-	size_t i, b;
-
-	for (i = 0; i < size; i++) {
-		if (i % 16 == 0)
-			printf("%08x  ", (uint32_t)data_ptr + i);
-		if (i % 8 == 0)
-			printf(" ");
-
-		printf("%02x ", data_ptr[i]);
-		if (i % 16 == 15) {
-			printf(" |");
-			for (b = 0; b < 16; b++){
-				if (isprint(data_ptr[i + b - 15]))
-					printf("%c", data_ptr[i + b - 15]);
-				else
-					printf(".");
-			}
-			printf("|\n");
-		}
-	}
-	printf("%08x\n", 16 + size - (size%16));
 }
