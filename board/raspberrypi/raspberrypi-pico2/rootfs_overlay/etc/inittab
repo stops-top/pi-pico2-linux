@@ -23,10 +23,14 @@
 
 console::respawn:/bin/sh
 
-# rcS is intentionally not run: there are no services to start here.
-# S40network needs ifup (disabled, CONFIG_NET=n), S01seedrng needs a writable
-# persistent /var/lib/seedrng and an entropy source (neither exists), and
-# S11modules is a no-op with CONFIG_MODULES=n.
+# Neither rcS nor rcK is run: there are no services on this board.  S40network
+# and S01seedrng are no longer even installed (BR2_PACKAGE_IFUPDOWN_SCRIPTS /
+# BR2_PACKAGE_URANDOM_SCRIPTS off) -- they need ifup/ifdown (CONFIG_NET=n) and a
+# persistent writable /var/lib/seedrng (read-only cramfs) respectively.  rcS,
+# rcK and S11modules still ship because BR2_INIT_BUSYBOX mandatorily selects
+# BR2_PACKAGE_INITSCRIPTS; leaving them uninvoked is deliberate.  Running rcK at
+# shutdown used to execute S11modules, whose `ls -A` needs a contiguous ~444KB
+# bFLT allocation and can fail with order:7 ENOMEM once memory is fragmented.
 
 #::sysinit:/sbin/swapon -a
 #null::sysinit:/bin/ln -sf /proc/self/fd /dev/fd
@@ -41,7 +45,6 @@ console::respawn:/bin/sh
 # Stuff to do for the 3-finger salute
 #::ctrlaltdel:/sbin/reboot
 
-# Stuff to do before rebooting
-::shutdown:/etc/init.d/rcK
+# Stuff to do before rebooting.  No rcK: see the comment above the shell entry.
 #::shutdown:/sbin/swapoff -a
 ::shutdown:/bin/umount -a -r

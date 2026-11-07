@@ -11,6 +11,12 @@ BR2_GLOBAL_PATCH_DIR="$(BR2_EXTERNAL)/board/raspberrypi/raspberrypi-pico2/patche
 BR2_PTHREADS_NONE=y
 BR2_OPTIMIZE_S=y
 BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL)/board/raspberrypi/raspberrypi-pico2/busybox.config"
+# Both default to y under the sysv skeleton but install scripts that cannot run
+# here: S40network calls ifup/ifdown (removed, CONFIG_NET=n) and S01seedrng needs
+# a persistent writable /var/lib/seedrng (root is read-only cramfs, no writable
+# flash path yet).  rcK would run them at every shutdown and print FAIL/EROFS.
+# BR2_PACKAGE_IFUPDOWN_SCRIPTS is not set
+# BR2_PACKAGE_URANDOM_SCRIPTS is not set
 
 # Filesystem
 BR2_TARGET_ROOTFS_CRAMFS=y
