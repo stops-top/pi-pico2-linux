@@ -11,3 +11,13 @@ sysfs		/sys		sysfs		defaults	0	0
 # small.  /dev/shm is omitted entirely: shm_open needs shmem, not just a mount.
 ramfs		/tmp		ramfs		mode=1777	0	0
 ramfs		/run		ramfs		mode=0755	0	0
+
+# Persistent storage on the writable 1.5 MiB tail of the QSPI NOR flash.
+# The source must be "mtd:data" (or "mtd2"): get_tree_mtd() only understands the
+# mtd: prefix, a bare label falls through to lookup_bdev() and fails.  There is
+# no /dev/mtdblock2 either -- CONFIG_BLOCK=n.
+# JFFS2 initialises an all-0xFF partition on first mount, so this works out of
+# the box.  If the tail ever holds garbage, mount fails and the fix is a one-off
+#   flash_eraseall -j /dev/mtd2 && mount /data
+# which destroys everything in /data -- never run it on a mounted filesystem.
+mtd:data	/data		jffs2		defaults	0	0

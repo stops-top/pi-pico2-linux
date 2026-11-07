@@ -42,6 +42,44 @@
 		};
 	};
 
+	/*
+	 * The NOR flash on QMI chip select 0.  reg is its XIP address range,
+	 * used only to derive the size: the driver never reads through that
+	 * window, because enabling QMI direct mode turns every memory-mapped
+	 * access into a bus error and the kernel runs from PSRAM on CS1.  All
+	 * flash traffic is bit-banged from the SRAM scratch region below.
+	 *
+	 * sram-scratch is 8 KiB at the top of the bootloader's 256 KiB SRAM
+	 * region.  The bootloader itself only reaches 0x20002ce0 and is dead
+	 * once it jumps here, and the kernel has no SRAM support at all, so
+	 * nothing else claims it.
+	 */
+	flash@10000000 {
+		compatible = "raspberrypi,rp2350-qspi-flash";
+		reg = <0x10000000 0x400000>;	/* 4 MiB on CS0 */
+		sram-scratch = <0x2003e000 0x2000>;
+
+		partitions {
+			#address-cells = <1>;
+			#size-cells = <1>;
+			compatible = "fixed-partitions";
+
+			/* Bootloader + DTB + kernel (all below 2M, bounded by
+			 * post-image.sh) + the 512K cramfs at 2M.  Read-only so
+			 * Linux cannot overwrite the image it booted from;
+			 * upgrading still means picotool from the host. */
+			partition@0 {
+				label = "firmware";
+				reg = <0x0 0x280000>;
+				read-only;
+			};
+			partition@280000 {
+				label = "data";
+				reg = <0x280000 0x180000>;	/* 1.5 MiB */
+			};
+		};
+	};
+
 	memory@11000000 {
 		device_type = "memory";
 		/*

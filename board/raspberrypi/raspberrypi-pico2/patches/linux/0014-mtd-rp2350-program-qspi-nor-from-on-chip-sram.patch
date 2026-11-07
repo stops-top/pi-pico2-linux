@@ -1,0 +1,806 @@
+Subject: [PATCH] mtd: rp2350: program the QSPI NOR flash from on-chip SRAM
+
+The 4 MiB NOR flash on QMI CS0 was read-only from Linux.  The bootloader copies
+the kernel and the cramfs rootfs into PSRAM and the kernel never touches the XIP
+window again, so nothing could be stored that survives a reboot.
+
+Add an MTD driver for it.  The hard constraint is that QMI_DIRECT_CSR.EN is not
+a stall: the register description says "memory-mapped accesses will generate bus
+errors when direct serial mode is enabled", and both XIP windows go through that
+interface.  This kernel's text, data and stack are all in PSRAM on CS1, so the
+routine that drives CS0 cannot run from it.  .sramtext is therefore a
+self-contained blob that the driver copies into 8 KiB of on-chip SRAM
+(0x2003e000, from the device tree's sram-scratch property) and calls through an
+assembly stub that switches to an SRAM stack.  Nothing in the blob may reach
+outside it, so the Makefile turns off the stack canary (tp points at a
+task_struct in PSRAM), jump tables, hot/cold partitioning, IPA-ICF, and the
+implicit memset that INIT_STACK_ALL_ZERO would otherwise let gcc emit for a
+local array.  The SRAM is provably free: the bootloader's own image ends at
+0x20002ce0 and is dead once it jumps, and the kernel has no SRAM support at all.
+
+Only CS0 is driven.  M1_TIMING/RFMT/RCMD/WFMT/WCMD and the CS1 bits are left
+alone, so the PSRAM stays in the quad mode the bootloader set up.  No cache
+maintenance is needed either: direct mode bypasses the XIP cache and nothing is
+invalidated, so dirty PSRAM lines are never dropped.  The flash is already in
+plain serial SPI mode -- flash_serial_mode() sent 0xFF/0x66/0x99 and configured
+M0 for 03h reads with MAX_SELECT=1 -- so no exit-XIP sequence is required, which
+matters because the ROM helper would reinitialise QMI for both chip selects.
+CLKDIV=4 and RXDELAY=3 mirror M0_TIMING; RXDELAY=0 samples too early at 37.5 MHz
+and is only safe at the few-MHz rate the bootloader used for its reset sequence.
+
+Erase and program are split into "start" and "poll status" operations.  Only the
+tens of microseconds of actual SPI traffic run with interrupts masked; the
+chip's 45 ms to 2 s busy time is spent with the kernel running normally, which is
+safe because CS0 is high and the kernel only ever touches CS1.  Programs are
+chunked on 256-byte page boundaries, since a page-program command wraps inside
+its page instead of advancing, and are read back afterwards -- this bus already
+proved sensitive enough that the bootloader verifies every copy.  Spin bounds
+in the blob and a 3 s jiffies deadline in the driver keep a stuck QMI from
+hanging the hart with interrupts masked and no recovery short of a power cycle.
+
+Partitions come from the device tree.  The firmware area (bootloader, DTB,
+kernel, and the 512 KiB cramfs at 2 MiB) is read-only so Linux cannot overwrite
+the image it booted from; upgrading that still means picotool from the host.
+The 1.5 MiB tail is writable and carries JFFS2.
+
+------ a/arch/riscv/kernel/vmlinux.lds.S
++++ b/arch/riscv/kernel/vmlinux.lds.S
+@@ -45,6 +45,13 @@
+ 		ENTRY_TEXT
+ 		IRQENTRY_TEXT
+ 		SOFTIRQENTRY_TEXT
++		. = ALIGN(4);
++		/* Copied to SRAM by the RP2350 QSPI driver and run there with
++		 * the XIP windows disabled; the entry stub must come first. */
++		__sramtext_start = .;
++		KEEP(*(.sramtext.entry))
++		KEEP(*(.sramtext))
++		__sramtext_end = .;
+ 		_etext = .;
+ 	}
+ 
+--- a/drivers/mtd/devices/Kconfig
++++ b/drivers/mtd/devices/Kconfig
+@@ -136,6 +136,18 @@
+ 	  doesn't have access to, memory beyond the mem=xxx limit, nvram,
+ 	  memory on the video card, etc...
+ 
++config MTD_RP2350_QSPI
++	tristate "RP2350 QMI CS0 NOR flash"
++	depends on ARCH_RP2350
++	help
++	  The NOR flash wired to the RP2350's QMI chip select 0.  The kernel
++	  runs from PSRAM on CS1, and enabling QMI direct mode turns every
++	  memory-mapped access into a bus error, so the erase/program/read
++	  routine is copied into on-chip SRAM and run there with interrupts
++	  masked.  Partitions come from the device tree; the firmware area is
++	  normally marked read-only so Linux cannot overwrite the image it
++	  booted from.
++
+ config MTD_MTDRAM
+ 	tristate "Test driver using RAM"
+ 	help
+--- a/drivers/mtd/devices/Makefile
++++ b/drivers/mtd/devices/Makefile
+@@ -6,6 +6,7 @@
+ obj-$(CONFIG_MTD_DOCG3)		+= docg3.o
+ obj-$(CONFIG_MTD_SLRAM)		+= slram.o
+ obj-$(CONFIG_MTD_PHRAM)		+= phram.o
++obj-$(CONFIG_MTD_RP2350_QSPI)	+= rp2350-qspi.o rp2350-qspi-sram.o
+ obj-$(CONFIG_MTD_PMC551)	+= pmc551.o
+ obj-$(CONFIG_MTD_MS02NV)	+= ms02-nv.o
+ obj-$(CONFIG_MTD_MTDRAM)	+= mtdram.o
+@@ -21,3 +22,13 @@
+ 
+ 
+ CFLAGS_docg3.o			+= -I$(src)
++
++# This object is copied verbatim into SRAM and run with the XIP windows
++# disabled, so it may not reference anything outside itself: no stack canary
++# (tp points into PSRAM), no jump table or constant pool in .rodata, no
++# hot/cold splitting into another section, no folding with a lookalike function
++# elsewhere in the kernel, and no memset call -- INIT_STACK_ALL_ZERO would
++# otherwise let gcc zero a local array by calling out to PSRAM.
++CFLAGS_rp2350-qspi-sram.o	+= -fno-stack-protector -fno-jump-tables \
++				   -fno-reorder-blocks-and-partition -fno-ipa-icf \
++				   -ftrivial-auto-var-init=uninitialized
+--- /dev/null
++++ b/drivers/mtd/devices/rp2350-qspi.h
+@@ -0,0 +1,64 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Shared layout between the RP2350 QSPI MTD driver and the routine it copies
++ * into on-chip SRAM.  Nothing here may pull in code: the SRAM side runs with
++ * QMI direct mode enabled, which turns every memory-mapped (XIP) access into a
++ * bus error, and the kernel text, data and stack all live in PSRAM.
++ */
++#ifndef _RP2350_QSPI_H
++#define _RP2350_QSPI_H
++
++#include <linux/types.h>
++
++/* Operations understood by rp2350_sram_payload(). */
++#define RP2350_OP_JEDEC_ID	0	/* 9Fh, 3 ID bytes into buf */
++#define RP2350_OP_READ		1	/* 03h, len bytes into buf */
++#define RP2350_OP_SECTOR_ERASE	2	/* 20h, start a 4 KiB erase */
++#define RP2350_OP_BLOCK_ERASE	3	/* D8h, start a 64 KiB erase */
++#define RP2350_OP_PAGE_PROGRAM	4	/* 02h, start a <=256 byte program */
++#define RP2350_OP_READ_STATUS	5	/* 05h, 1 byte into buf[0] and status */
++
++#define RP2350_STATUS_WIP	0x01	/* write in progress */
++
++/* Non-zero returns from the payload; the driver maps them all to -EIO. */
++#define RP2350_SRAM_TIMEOUT	1
++#define RP2350_SRAM_EINVAL	2
++
++/* One NOR page.  A program command may not cross a page boundary. */
++#define RP2350_FLASH_PAGE_SIZE	256
++/* Reads and read-back verification move this much per QMI direct-mode setup;
++ * programs are still split on RP2350_FLASH_PAGE_SIZE boundaries. */
++#define RP2350_SRAM_BUF_SIZE	1024
++
++/*
++ * Offsets inside the "sram-scratch" region.  The code blob is the verbatim
++ * .sramtext output section, so it starts with the entry stub; the payload
++ * follows at whatever offset the linker chose.
++ */
++#define RP2350_SRAM_SIZE	0x2000
++#define RP2350_SRAM_CODE_OFF	0x0000
++#define RP2350_SRAM_CODE_MAX	0x1000
++#define RP2350_SRAM_STACK_OFF	0x1000
++#define RP2350_SRAM_STACK_SIZE	0x0800
++#define RP2350_SRAM_ARGS_OFF	0x1800
++
++/*
++ * Lives in SRAM for the whole call.  The first three words are written by the
++ * entry stub, which has nowhere else to put the PSRAM stack pointer it is
++ * about to abandon; keep them in sync with the sw/lw offsets in the stub.
++ */
++struct rp2350_sram_args {
++	u32 saved_sp;			/* 0 */
++	u32 saved_s0;			/* 4 */
++	u32 saved_ra;			/* 8 */
++	u32 op;				/* 12 */
++	u32 offset;			/* 16: byte offset into the CS0 flash */
++	u32 len;			/* 20: bytes in buf */
++	u32 status;			/* 24: last RDSR value */
++	u8  buf[RP2350_SRAM_BUF_SIZE];	/* 28 */
++};
++
++/* Defined in .sramtext; the driver calls it only through the relocated address. */
++u32 rp2350_sram_payload(struct rp2350_sram_args *a);
++
++#endif /* _RP2350_QSPI_H */
+\ No newline at end of file
+--- /dev/null
++++ b/drivers/mtd/devices/rp2350-qspi-sram.c
+@@ -0,0 +1,264 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * RP2350 QMI direct-mode flash access, copied verbatim into on-chip SRAM and
++ * executed there with interrupts masked.
++ *
++ * QMI_DIRECT_CSR.EN is not a stall: the register description says "memory-
++ * mapped accesses will generate bus errors when direct serial mode is
++ * enabled".  Both XIP windows go through that interface, and this kernel runs
++ * entirely from PSRAM on CS1 -- text, data, stack and all.  So from the moment
++ * EN is set until it is cleared again the hart may only touch this blob, the
++ * SRAM stack and args block, and peripheral registers.  That rules out
++ * printk, memcpy, udelay, the stack canary (tp points at a task_struct in
++ * PSRAM) and any call outside .sramtext.
++ *
++ * Only CS0 is driven.  M1_TIMING/RFMT/RCMD/WFMT/WCMD and ASSERT_CS1N are left
++ * alone, so the PSRAM stays in the quad mode the bootloader set up and XIP
++ * resumes unchanged.  No cache maintenance is needed either: direct mode
++ * bypasses the XIP cache, and nothing is invalidated, so dirty PSRAM lines
++ * stay in the cache and are written back as usual.
++ *
++ * The flash is already in plain serial SPI mode -- the bootloader's
++ * flash_serial_mode() reset it and configured M0 for 03h reads with
++ * MAX_SELECT=1 -- so standard commands work without an exit-XIP sequence.
++ */
++
++#include <linux/build_bug.h>
++#include <linux/compiler.h>
++#include <linux/io.h>
++#include <linux/stddef.h>
++#include <linux/types.h>
++
++#include "rp2350-qspi.h"
++
++/*
++ * Entry stub, placed first in the blob by the linker script.  It cannot save
++ * the old stack pointer on the old stack, so it parks sp/s0/ra in the args
++ * block (which is already in SRAM) before switching.
++ *
++ * a0 = SRAM stack top, a1 = relocated payload address, a2 = args.
++ */
++asm(
++	".section .sramtext.entry,\"ax\",@progbits\n"
++	".balign 4\n"
++	".globl rp2350_sram_entry\n"
++	".type rp2350_sram_entry, @function\n"
++	"rp2350_sram_entry:\n"
++	"	sw   sp, 0(a2)\n"
++	"	sw   s0, 4(a2)\n"
++	"	sw   ra, 8(a2)\n"
++	"	mv   s0, a2\n"
++	"	mv   sp, a0\n"
++	"	mv   a0, s0\n"
++	"	jalr ra, a1\n"
++	"	mv   t0, a0\n"
++	"	mv   a0, s0\n"
++	"	lw   ra, 8(a0)\n"
++	"	lw   s0, 4(a0)\n"
++	"	lw   sp, 0(a0)\n"
++	"	mv   a0, t0\n"
++	"	ret\n"
++	".size rp2350_sram_entry, .-rp2350_sram_entry\n"
++	".previous\n"
++);
++
++#define QMI_BASE		0x400d0000UL
++#define QMI_DIRECT_CSR		0x00UL
++#define QMI_DIRECT_TX		0x04UL
++#define QMI_DIRECT_RX		0x08UL
++
++#define CSR_EN			0x00000001U
++#define CSR_BUSY		0x00000002U
++#define CSR_ASSERT_CS0N		0x00000004U
++#define CSR_ASSERT_CS1N		0x00000008U
++#define CSR_AUTO_CS0N		0x00000040U
++#define CSR_AUTO_CS1N		0x00000080U
++#define CSR_TXFULL		0x00000400U
++#define CSR_RXEMPTY		0x00010000U
++#define CSR_CLKDIV_SHIFT	22
++/* clk_sys is 150 MHz; /4 matches the M0 XIP timing the bootloader chose and
++ * stays under the 50 MHz limit for a plain 03h read. */
++#define CSR_CLKDIV		4U
++#define CSR_RXDELAY_SHIFT	30
++/* Same sample delay as M0_TIMING.  RXDELAY=0 captures SDI simultaneously with
++ * the SCK launch edge, which is only safe at the few-MHz rates the bootloader
++ * used for its reset sequence; at 37.5 MHz the pad round trip needs the delay. */
++#define CSR_RXDELAY		3U
++/* Software owns both chip selects in direct mode.  Leaving ASSERT_CS1N set
++ * would drive CS0 and CS1 low together on a shared bus. */
++#define CSR_CS_MASK		(CSR_ASSERT_CS0N | CSR_ASSERT_CS1N | \
++				 CSR_AUTO_CS0N | CSR_AUTO_CS1N)
++
++#define TX_OE			0x00080000U
++
++#define CMD_PAGE_PROGRAM	0x02U
++#define CMD_READ		0x03U
++#define CMD_READ_STATUS		0x05U
++#define CMD_WRITE_ENABLE	0x06U
++#define CMD_SECTOR_ERASE	0x20U
++#define CMD_BLOCK_ERASE		0xd8U
++#define CMD_JEDEC_ID		0x9fU
++
++/* Upper bound on a stuck BUSY flag, roughly 100 ms of register polls.  A
++ * forever-spin here would hang the hart with interrupts masked and no way to
++ * recover short of a power cycle. */
++#define IDLE_SPIN_LIMIT		1000000U
++
++static __section(".sramtext") __always_inline u32 qmi_rd(unsigned long reg)
++{
++	return readl((void __iomem *)(QMI_BASE + reg));
++}
++
++static __section(".sramtext") __always_inline void qmi_wr(unsigned long reg, u32 val)
++{
++	writel(val, (void __iomem *)(QMI_BASE + reg));
++}
++
++/* Direct mode does not apply the QMI's MIN_DESELECT timing, so leave CS0 high
++ * for a few hundred ns between commands (tSHSL). */
++static __section(".sramtext") __always_inline void cs0_gap(void)
++{
++	u32 i;
++
++	for (i = 0; i < 64; i++)
++		asm volatile("nop");
++}
++
++static __section(".sramtext") __always_inline u32 cs0_wait_idle(void)
++{
++	u32 spins = 0;
++
++	while (qmi_rd(QMI_DIRECT_CSR) & CSR_BUSY) {
++		if (++spins > IDLE_SPIN_LIMIT)
++			return RP2350_SRAM_TIMEOUT;
++	}
++	return 0;
++}
++
++/*
++ * Clock n bytes out of tx (0xff when tx is NULL, i.e. a read) and capture the
++ * bytes sampled at the same time into rx (discarded when rx is NULL).  The
++ * serial engine stalls on a full RX FIFO, so pushing and popping in one loop
++ * is self-throttling; the spin bound only fires if the hardware stops.
++ */
++static __section(".sramtext") __always_inline u32
++cs0_xfer(const u8 *tx, u8 *rx, u32 n)
++{
++	u32 t = 0, r = 0, spins = 0;
++	u32 limit = (n << 6) + 1024;
++
++	while (t < n || r < n) {
++		u32 flags = qmi_rd(QMI_DIRECT_CSR);
++
++		if (t < n && !(flags & CSR_TXFULL)) {
++			qmi_wr(QMI_DIRECT_TX, TX_OE | (tx ? tx[t] : 0xff));
++			t++;
++		}
++		if (r < n && !(flags & CSR_RXEMPTY)) {
++			u8 v = (u8)qmi_rd(QMI_DIRECT_RX);
++
++			if (rx)
++				rx[r] = v;
++			r++;
++		}
++		if (++spins > limit)
++			return RP2350_SRAM_TIMEOUT;
++	}
++	return 0;
++}
++
++/* A command with no address and no data, e.g. WRITE ENABLE. */
++static __section(".sramtext") __always_inline u32 cs0_simple(u32 csr, u8 cmd)
++{
++	u32 ret;
++
++	qmi_wr(QMI_DIRECT_CSR, csr | CSR_ASSERT_CS0N);
++	ret = cs0_xfer(&cmd, NULL, 1);
++	if (!ret)
++		ret = cs0_wait_idle();
++	qmi_wr(QMI_DIRECT_CSR, csr & ~CSR_ASSERT_CS0N);
++	cs0_gap();
++	return ret;
++}
++
++__section(".sramtext") noinline
++u32 rp2350_sram_payload(struct rp2350_sram_args *a)
++{
++	u32 saved_csr, csr, ret, ncmd;
++	u8 cmd[4];
++
++	if (a->len > RP2350_SRAM_BUF_SIZE)
++		return RP2350_SRAM_EINVAL;
++
++	BUILD_BUG_ON(offsetof(struct rp2350_sram_args, saved_sp) != 0);
++	BUILD_BUG_ON(offsetof(struct rp2350_sram_args, saved_s0) != 4);
++	BUILD_BUG_ON(offsetof(struct rp2350_sram_args, saved_ra) != 8);
++
++	saved_csr = qmi_rd(QMI_DIRECT_CSR);
++	csr = (saved_csr & ~CSR_CS_MASK) |
++	      (CSR_RXDELAY << CSR_RXDELAY_SHIFT) |
++	      (CSR_CLKDIV << CSR_CLKDIV_SHIFT) | CSR_EN;
++	qmi_wr(QMI_DIRECT_CSR, csr);
++
++	/* A memory-mapped transfer that was already in flight cannot be
++	 * halted; wait for it before taking CS0. */
++	ret = cs0_wait_idle();
++	if (ret)
++		goto out;
++
++	if (a->op == RP2350_OP_JEDEC_ID) {
++		cmd[0] = CMD_JEDEC_ID;
++		ncmd = 1;
++	} else if (a->op == RP2350_OP_READ_STATUS) {
++		cmd[0] = CMD_READ_STATUS;
++		ncmd = 1;
++	} else {
++		if (a->op == RP2350_OP_READ) {
++			cmd[0] = CMD_READ;
++		} else {
++			/* Erase and program both latch on CS0 rising, and both
++			 * need WREN in a separate frame first. */
++			ret = cs0_simple(csr, CMD_WRITE_ENABLE);
++			if (ret)
++				goto out;
++			if (a->op == RP2350_OP_SECTOR_ERASE)
++				cmd[0] = CMD_SECTOR_ERASE;
++			else if (a->op == RP2350_OP_BLOCK_ERASE)
++				cmd[0] = CMD_BLOCK_ERASE;
++			else
++				cmd[0] = CMD_PAGE_PROGRAM;
++		}
++		cmd[1] = a->offset >> 16;
++		cmd[2] = a->offset >> 8;
++		cmd[3] = a->offset;
++		ncmd = 4;
++	}
++
++	qmi_wr(QMI_DIRECT_CSR, csr | CSR_ASSERT_CS0N);
++	ret = cs0_xfer(cmd, NULL, ncmd);
++	if (ret)
++		goto release;
++
++	if (a->op == RP2350_OP_READ)
++		ret = cs0_xfer(NULL, a->buf, a->len);
++	else if (a->op == RP2350_OP_PAGE_PROGRAM)
++		ret = cs0_xfer(a->buf, NULL, a->len);
++	else if (a->op == RP2350_OP_JEDEC_ID)
++		ret = cs0_xfer(NULL, a->buf, 3);
++	else if (a->op == RP2350_OP_READ_STATUS)
++		ret = cs0_xfer(NULL, a->buf, 1);
++	/* An erase sends nothing after the address. */
++
++release:
++	if (!ret)
++		ret = cs0_wait_idle();
++	qmi_wr(QMI_DIRECT_CSR, csr & ~CSR_ASSERT_CS0N);
++	cs0_gap();
++out:
++	/* Restoring EN=0 re-enables the XIP windows, so this must happen before
++	 * the stub returns to the caller's PSRAM stack. */
++	qmi_wr(QMI_DIRECT_CSR, saved_csr);
++	if (!ret && a->op == RP2350_OP_READ_STATUS)
++		a->status = a->buf[0];
++	return ret;
++}
+\ No newline at end of file
+--- /dev/null
++++ b/drivers/mtd/devices/rp2350-qspi.c
+@@ -0,0 +1,360 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * MTD driver for the NOR flash on the RP2350's QMI CS0.
++ *
++ * The kernel runs from PSRAM on CS1 and never reads flash through the XIP
++ * window, so every access here goes through QMI direct mode from the SRAM
++ * routine in rp2350-qspi-sram.c.  Erase and program are split into "start" and
++ * "poll status" so the chip's millisecond-scale busy time is spent with
++ * interrupts enabled and the kernel running normally; only the few tens of
++ * microseconds of actual SPI traffic run with interrupts masked.
++ *
++ * Copyright (C) 2026
++ */
++
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/io.h>
++#include <linux/jiffies.h>
++#include <linux/kernel.h>
++#include <linux/minmax.h>
++#include <linux/module.h>
++#include <linux/mtd/mtd.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++
++#include "rp2350-qspi.h"
++
++#define RP2350_XIP_BASE		0x10000000UL
++#define RP2350_SECTOR_SIZE	0x1000U
++#define RP2350_BLOCK_SIZE	0x10000U
++/* Covers the 2 s worst-case 64 KiB block erase with margin. */
++#define RP2350_READY_TIMEOUT_MS	3000
++/* Page program is 0.7 ms typical, 3 ms max; 50 us is 14 polls worst case. */
++#define RP2350_STATUS_POLL_US	50
++
++extern char __sramtext_start[], __sramtext_end[];
++
++/* The args block grows with RP2350_SRAM_BUF_SIZE; make sure it still fits after
++ * the code and stack regions. */
++static_assert(offsetof(struct rp2350_sram_args, buf) + RP2350_SRAM_BUF_SIZE <=
++	      RP2350_SRAM_SIZE - RP2350_SRAM_ARGS_OFF);
++
++struct rp2350_qspi {
++	struct device *dev;
++	struct mtd_info mtd;
++	/* Serialises the single SRAM args block and the QMI direct window. */
++	struct mutex lock;
++	void *sram;
++	unsigned long entry;
++	unsigned long payload;
++	unsigned long stack_top;
++	struct rp2350_sram_args *args;
++};
++
++static int rp2350_run(struct rp2350_qspi *q, u32 op, u32 offset, u32 len)
++{
++	typedef u32 (*entry_t)(unsigned long sp, void *fn, void *args);
++	struct rp2350_sram_args *a = q->args;
++	unsigned long flags;
++	u32 ret;
++
++	a->op = op;
++	a->offset = offset;
++	a->len = len;
++	a->status = 0;
++
++	local_irq_save(flags);
++	ret = ((entry_t)q->entry)(q->stack_top, (void *)q->payload, a);
++	local_irq_restore(flags);
++
++	if (ret) {
++		dev_err(q->dev, "flash op %u at 0x%08x failed: %u\n",
++			op, offset, ret);
++		return -EIO;
++	}
++	return 0;
++}
++
++/* Called with q->lock held.  Between polls the flash is busy but CS0 is high,
++ * so the kernel is free to run: it only ever touches CS1.
++ *
++ * spin=true is for page programs: they finish in ~0.7 ms, and with HZ=250 and
++ * no high-resolution timers usleep_range() rounds up to a whole 4 ms jiffy, so
++ * sleeping would make a 256-byte page take six times longer than the work.
++ * udelay() reads the 1 MHz time CSR and is exact here.  Erases are 45 ms to
++ * 2 s, so they sleep instead of burning the CPU. */
++static int rp2350_wait_ready(struct rp2350_qspi *q, bool spin)
++{
++	unsigned long deadline = jiffies + msecs_to_jiffies(RP2350_READY_TIMEOUT_MS);
++
++	for (;;) {
++		int ret = rp2350_run(q, RP2350_OP_READ_STATUS, 0, 1);
++
++		if (ret)
++			return ret;
++		if (!(q->args->status & RP2350_STATUS_WIP))
++			return 0;
++		if (time_after(jiffies, deadline)) {
++			dev_err(q->dev, "flash still busy after %u ms\n",
++				RP2350_READY_TIMEOUT_MS);
++			return -ETIMEDOUT;
++		}
++		if (spin)
++			udelay(RP2350_STATUS_POLL_US);
++		else
++			usleep_range(1000, 2000);
++	}
++}
++
++static int rp2350_read(struct mtd_info *mtd, loff_t from, size_t len,
++		       size_t *retlen, u_char *buf)
++{
++	struct rp2350_qspi *q = mtd->priv;
++	size_t done = 0;
++	int ret = 0;
++
++	*retlen = 0;
++	if (from < 0 || len > mtd->size - from)
++		return -EINVAL;
++
++	mutex_lock(&q->lock);
++	while (done < len) {
++		u32 n = min_t(size_t, len - done, RP2350_SRAM_BUF_SIZE);
++
++		ret = rp2350_run(q, RP2350_OP_READ, (u32)(from + done), n);
++		if (ret)
++			break;
++		memcpy(buf + done, q->args->buf, n);
++		done += n;
++	}
++	mutex_unlock(&q->lock);
++
++	*retlen = done;
++	return ret;
++}
++
++/* Called with q->lock held.  The bootloader needed a read-back on every flash
++ * copy to get stable data out of this bus; hold programmed data to the same
++ * standard rather than trusting the status register alone. */
++static int rp2350_verify(struct rp2350_qspi *q, loff_t off, const u8 *buf,
++			 size_t len)
++{
++	size_t done = 0;
++
++	while (done < len) {
++		u32 n = min_t(size_t, len - done, RP2350_SRAM_BUF_SIZE);
++		int ret = rp2350_run(q, RP2350_OP_READ, (u32)(off + done), n);
++
++		if (ret)
++			return ret;
++		if (memcmp(buf + done, q->args->buf, n)) {
++			dev_err(q->dev, "read-back mismatch at 0x%08llx\n",
++				(unsigned long long)(off + done));
++			return -EIO;
++		}
++		done += n;
++	}
++	return 0;
++}
++
++static int rp2350_write(struct mtd_info *mtd, loff_t to, size_t len,
++			size_t *retlen, const u_char *buf)
++{
++	struct rp2350_qspi *q = mtd->priv;
++	size_t done = 0;
++	int ret = 0;
++
++	*retlen = 0;
++	if (to < 0 || len > mtd->size - to)
++		return -EINVAL;
++
++	mutex_lock(&q->lock);
++	while (done < len) {
++		u32 addr = (u32)(to + done);
++		/* A program command wraps inside its 256-byte page instead of
++		 * advancing, so never let one straddle a page boundary. */
++		u32 n = min3(len - done,
++			     (size_t)(RP2350_FLASH_PAGE_SIZE -
++				      (addr & (RP2350_FLASH_PAGE_SIZE - 1))),
++			     (size_t)RP2350_SRAM_BUF_SIZE);
++
++		memcpy(q->args->buf, buf + done, n);
++		ret = rp2350_run(q, RP2350_OP_PAGE_PROGRAM, addr, n);
++		if (ret)
++			break;
++		ret = rp2350_wait_ready(q, true);
++		if (ret)
++			break;
++		done += n;
++	}
++	if (!ret)
++		ret = rp2350_verify(q, to, buf, done);
++	mutex_unlock(&q->lock);
++
++	*retlen = done;
++	return ret;
++}
++
++static int rp2350_erase(struct mtd_info *mtd, struct erase_info *instr)
++{
++	struct rp2350_qspi *q = mtd->priv;
++	u64 addr, end;
++	int ret = 0;
++
++	if (instr->addr >= mtd->size || instr->len > mtd->size - instr->addr)
++		return -EINVAL;
++	if ((instr->addr | instr->len) & (mtd->erasesize - 1))
++		return -EINVAL;
++
++	end = instr->addr + instr->len;
++	mutex_lock(&q->lock);
++	for (addr = instr->addr; addr < end; ) {
++		u32 op = RP2350_OP_SECTOR_ERASE;
++		u32 step = RP2350_SECTOR_SIZE;
++
++		if (!(addr & (RP2350_BLOCK_SIZE - 1)) &&
++		    end - addr >= RP2350_BLOCK_SIZE) {
++			op = RP2350_OP_BLOCK_ERASE;
++			step = RP2350_BLOCK_SIZE;
++		}
++		ret = rp2350_run(q, op, (u32)addr, 0);
++		if (ret)
++			break;
++		ret = rp2350_wait_ready(q, false);
++		if (ret)
++			break;
++		addr += step;
++	}
++	mutex_unlock(&q->lock);
++
++	if (ret)
++		instr->fail_addr = addr;
++	return ret;
++}
++
++static int rp2350_qspi_probe(struct platform_device *pdev)
++{
++	struct device_node *np = pdev->dev.of_node;
++	struct device *dev = &pdev->dev;
++	struct resource *res;
++	struct rp2350_qspi *q;
++	u32 scratch[2];
++	size_t code_size;
++	u32 size;
++	const u8 *id;
++	int ret;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
++		return -EINVAL;
++	if (res->start != RP2350_XIP_BASE) {
++		dev_err(dev, "only CS0 flash at 0x%08lx is supported\n",
++			RP2350_XIP_BASE);
++		return -EINVAL;
++	}
++	size = resource_size(res);
++	if (!size || size & (RP2350_SECTOR_SIZE - 1))
++		return -EINVAL;
++
++	ret = of_property_read_u32_array(np, "sram-scratch", scratch, 2);
++	if (ret)
++		return ret;
++	if (scratch[1] < RP2350_SRAM_SIZE) {
++		dev_err(dev, "sram-scratch must be at least %u bytes\n",
++			RP2350_SRAM_SIZE);
++		return -EINVAL;
++	}
++
++	q = devm_kzalloc(dev, sizeof(*q), GFP_KERNEL);
++	if (!q)
++		return -ENOMEM;
++
++	q->dev = dev;
++	mutex_init(&q->lock);
++	/* On-chip SRAM is ordinary memory that the kernel does not claim, and
++	 * nommu has no page tables, so the physical address is directly
++	 * dereferenceable -- ioremap() would just cast it back anyway. */
++	q->sram = (void *)(uintptr_t)scratch[0];
++	q->args = (struct rp2350_sram_args *)(q->sram + RP2350_SRAM_ARGS_OFF);
++	q->stack_top = (unsigned long)q->sram + RP2350_SRAM_STACK_OFF +
++		       RP2350_SRAM_STACK_SIZE;
++
++	code_size = __sramtext_end - __sramtext_start;
++	if (code_size > RP2350_SRAM_CODE_MAX) {
++		dev_err(dev, ".sramtext is %zu bytes, only %u fit in SRAM\n",
++			code_size, RP2350_SRAM_CODE_MAX);
++		return -EINVAL;
++	}
++	memcpy(q->sram + RP2350_SRAM_CODE_OFF, __sramtext_start, code_size);
++	asm volatile("fence.i" ::: "memory");
++
++	q->entry = (unsigned long)q->sram + RP2350_SRAM_CODE_OFF;
++	q->payload = q->entry + ((unsigned long)rp2350_sram_payload -
++				 (unsigned long)__sramtext_start);
++	platform_set_drvdata(pdev, q);
++
++	ret = rp2350_run(q, RP2350_OP_JEDEC_ID, 0, 3);
++	if (ret)
++		return ret;
++	id = q->args->buf;
++	if ((id[0] == 0xff && id[1] == 0xff && id[2] == 0xff) ||
++	    (id[0] == 0x00 && id[1] == 0x00 && id[2] == 0x00)) {
++		dev_err(dev, "no flash on CS0 (ID %02x %02x %02x)\n",
++			id[0], id[1], id[2]);
++		return -ENODEV;
++	}
++	dev_info(dev, "CS0 flash ID %02x %02x %02x, %u KiB, %u KiB erase\n",
++		 id[0], id[1], id[2], size / 1024, RP2350_SECTOR_SIZE / 1024);
++
++	q->mtd.name = "rp2350-flash";
++	q->mtd.owner = THIS_MODULE;
++	q->mtd.type = MTD_NORFLASH;
++	q->mtd.flags = MTD_CAP_NORFLASH;
++	q->mtd.size = size;
++	q->mtd.erasesize = RP2350_SECTOR_SIZE;
++	q->mtd.writesize = 1;
++	q->mtd.oobsize = 0;
++	q->mtd.priv = q;
++	q->mtd._read = rp2350_read;
++	q->mtd._write = rp2350_write;
++	q->mtd._erase = rp2350_erase;
++	q->mtd.dev.parent = dev;
++	mtd_set_of_node(&q->mtd, np);
++
++	ret = mtd_device_register(&q->mtd, NULL, 0);
++	if (ret) {
++		dev_err(dev, "failed to register MTD device: %d\n", ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void rp2350_qspi_remove(struct platform_device *pdev)
++{
++	struct rp2350_qspi *q = platform_get_drvdata(pdev);
++
++	mtd_device_unregister(&q->mtd);
++}
++
++static const struct of_device_id rp2350_qspi_of_match[] = {
++	{ .compatible = "raspberrypi,rp2350-qspi-flash" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, rp2350_qspi_of_match);
++
++static struct platform_driver rp2350_qspi_driver = {
++	.probe	= rp2350_qspi_probe,
++	.remove	= rp2350_qspi_remove,
++	.driver	= {
++		.name		= "rp2350-qspi",
++		.of_match_table	= rp2350_qspi_of_match,
++	},
++};
++module_platform_driver(rp2350_qspi_driver);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("RP2350 QMI CS0 NOR flash, programmed from on-chip SRAM");
+\ No newline at end of file
