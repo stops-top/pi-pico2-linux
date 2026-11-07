@@ -1,0 +1,29 @@
+Subject: [PATCH] rp2350: fix the malformed ARCH_RP2350 Kconfig block
+
+Patch 0011 nested 'config GOLDFISH', 'config IRQ_STACKS' and the help text
+inside the ARCH_RP2350 entry.  'config' is a keyword, not an attribute, so those
+lines actually terminated ARCH_RP2350 and started two new symbols, leaving
+ARCH_RP2350 with no help text and attaching the RP2350 help to IRQ_STACKS.
+
+Give ARCH_RP2350 its own help text and drop the nested redefinitions.  GOLDFISH
+is already pinned to n in the board fragment; IRQ_STACKS is pinned there too
+now, preserving the previous .config exactly.
+
+---
+--- a/arch/riscv/Kconfig.socs	2026-11-07 15:50:22.446950109 +0800
++++ b/arch/riscv/Kconfig.socs	2026-11-07 15:55:32.320420854 +0800
+@@ -30,12 +30,9 @@
+ 	select MTD_PHRAM
+ 	select CRAMFS
+ 	select CRAMFS_MTD
+-	config GOLDFISH
+-		def_bool n
+-	config IRQ_STACKS
+-		def_bool n
+ 	help
+-          This enables support for Raspberry Pi RP2350 microcontroller.
++	  This enables support for the Raspberry Pi RP2350 microcontroller
++	  (Hazard3 RISC-V core, nommu, QSPI flash + PSRAM).
+ 
+ config ARCH_SIFIVE
+ 	bool "SiFive SoCs"

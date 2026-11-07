@@ -1,0 +1,96 @@
+Subject: [PATCH] rp2350: do the futex RMW as an interrupt-masked load/store
+
+Patch 0007 rewrote the bitops/atomic/cmpxchg AMOs but missed __futex_atomic_op
+in asm/futex.h, leaving five AMOs in futex_wake_op().  On the RP2350 XIP window
+those fault and fall into the trap emulator, which dereferenced the user
+pointer directly.  access_ok() is unconditionally true on nommu, so a bad
+address either returned success instead of -EFAULT (the emulator skipped
+fixup_exception) or faulted again inside the trap handler and panicked.
+
+Do the RMW as arch_local_irq_save() + lw/sw, matching the already-converted
+futex_atomic_cmpxchg_inatomic() in the same file, and keep the exception-table
+entries on both halves so a bad user address still yields -EFAULT.  Hazard3 is
+single core and in-order, so masking interrupts is equivalent to an atomic here.
+
+---
+--- a/arch/riscv/include/asm/futex.h	2026-11-07 15:50:22.439616776 +0800
++++ b/arch/riscv/include/asm/futex.h	2026-11-07 15:51:50.246474379 +0800
+@@ -19,17 +19,45 @@
+ #define __disable_user_access()		do { } while (0)
+ #endif
+ 
+-#define __futex_atomic_op(insn, ret, oldval, uaddr, oparg)	\
++/*
++ * See the comment in asm/bitops.h: AMOs fault on the RP2350 XIP window, so do
++ * the futex RMW as an interrupt-masked load/modify/store instead (single core,
++ * in-order Hazard3), matching futex_atomic_cmpxchg_inatomic() below.  Keeping
++ * the exception-table entries matters: access_ok() is always true on nommu, so
++ * a bad user address must still surface as -EFAULT here instead of being
++ * silently "emulated" by the AMO trap handler.
++ */
++#define __futex_apply_set(x, v)		((u32)(v))
++#define __futex_apply_add(x, v)		((u32)(x) + (u32)(v))
++#define __futex_apply_or(x, v)		((u32)(x) | (u32)(v))
++#define __futex_apply_and(x, v)		((u32)(x) & (u32)(v))
++#define __futex_apply_xor(x, v)		((u32)(x) ^ (u32)(v))
++
++#define __futex_atomic_op(op, ret, oldval, uaddr, oparg)	\
+ {								\
++	unsigned long __flags;					\
++	u32 __new;						\
+ 	__enable_user_access();					\
++	__flags = arch_local_irq_save();			\
+ 	__asm__ __volatile__ (					\
+-	"1:	" insn "				\n"	\
++	"1:	lw %[ov], %[u]				\n"	\
+ 	"2:						\n"	\
+ 	_ASM_EXTABLE_UACCESS_ERR(1b, 2b, %[r])			\
+ 	: [r] "+r" (ret), [ov] "=&r" (oldval),			\
+ 	  [u] "+m" (*uaddr)					\
+-	: [op] "Jr" (oparg)					\
++	:							\
+ 	: "memory");						\
++	if (!ret) {						\
++		__new = __futex_apply_##op(oldval, oparg);	\
++		__asm__ __volatile__ (				\
++		"3:	sw %z[nv], %[u]			\n"	\
++		"4:						\n"	\
++		_ASM_EXTABLE_UACCESS_ERR(3b, 4b, %[r])		\
++		: [r] "+r" (ret), [u] "+m" (*uaddr)		\
++		: [nv] "Jr" (__new)				\
++		: "memory");					\
++	}							\
++	arch_local_irq_restore(__flags);			\
+ 	__disable_user_access();				\
+ }
+ 
+@@ -43,24 +71,19 @@
+ 
+ 	switch (op) {
+ 	case FUTEX_OP_SET:
+-		__futex_atomic_op("amoswap.w.aqrl %[ov],%z[op],%[u]",
+-				  ret, oldval, uaddr, oparg);
++		__futex_atomic_op(set, ret, oldval, uaddr, oparg);
+ 		break;
+ 	case FUTEX_OP_ADD:
+-		__futex_atomic_op("amoadd.w.aqrl %[ov],%z[op],%[u]",
+-				  ret, oldval, uaddr, oparg);
++		__futex_atomic_op(add, ret, oldval, uaddr, oparg);
+ 		break;
+ 	case FUTEX_OP_OR:
+-		__futex_atomic_op("amoor.w.aqrl %[ov],%z[op],%[u]",
+-				  ret, oldval, uaddr, oparg);
++		__futex_atomic_op(or, ret, oldval, uaddr, oparg);
+ 		break;
+ 	case FUTEX_OP_ANDN:
+-		__futex_atomic_op("amoand.w.aqrl %[ov],%z[op],%[u]",
+-				  ret, oldval, uaddr, ~oparg);
++		__futex_atomic_op(and, ret, oldval, uaddr, ~oparg);
+ 		break;
+ 	case FUTEX_OP_XOR:
+-		__futex_atomic_op("amoxor.w.aqrl %[ov],%z[op],%[u]",
+-				  ret, oldval, uaddr, oparg);
++		__futex_atomic_op(xor, ret, oldval, uaddr, oparg);
+ 		break;
+ 	default:
+ 		ret = -ENOSYS;

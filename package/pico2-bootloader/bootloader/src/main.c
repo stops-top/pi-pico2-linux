@@ -33,6 +33,10 @@
 #define PSRAM_LOCATION (0x11000000U)
 #define PSRAM_ROOTFS_ADDR	0x11700000U
 #define PSRAM_DTB_ADDR		0x11780000U
+/* Must match genimage.cfg's cramfs partition size and the DTS phram reg;
+ * post-image.sh enforces this.  The DTS also declares the PSRAM above
+ * 0x11781000 as system memory, so do not grow this past 0x80000 without
+ * moving the DTB slot and shrinking that second memory range. */
 #define ROOTFS_MAX_SIZE		0x80000U
 /* genimage.cfg places the cramfs partition at flash offset 2M. */
 #define FLASH_ROOTFS_ADDR	(0x10000000U + 0x200000U)

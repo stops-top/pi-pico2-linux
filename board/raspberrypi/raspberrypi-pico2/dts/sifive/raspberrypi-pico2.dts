@@ -4,16 +4,26 @@
 	#address-cells = <1>;
 	#size-cells = <1>;
 	compatible = "riscv-minimal-nommu";
-	model = "riscv-minimal-nommu,qemu";
+	model = "Raspberry Pi RP2350 (Hazard3 RISC-V, nommu)";
 
 	chosen {
 		bootargs = "earlycon=pl011,mmio32,0x40070000 console=ttyAMA0 root=mtd:cramfs rootfstype=cramfs ro";
+		stdout-path = "serial0:115200n8";
+	};
+
+	aliases {
+		serial0 = &uart0;
+		serial1 = &uart1;
 	};
 
 	/*
 	 * Reading the QSPI window while executing from PSRAM makes the shared
 	 * QSPI bus switch chip selects constantly, so the bootloader copies the
 	 * rootfs into PSRAM and the kernel never touches flash again.
+	 *
+	 * The 0x80000 size is duplicated in genimage.cfg (partition cramfs) and
+	 * in the bootloader's ROOTFS_MAX_SIZE; post-image.sh checks that the
+	 * built image still fits.  Change all three together.
 	 */
 	rootfs@11700000 {
 		compatible = "phram";
@@ -34,7 +44,13 @@
 
 	memory@11000000 {
 		device_type = "memory";
-		reg = <0x11000000 0x700000>;	/* 7MB; 0x11700000 = rootfs, 0x11780000 = DTB */
+		/*
+		 * 7MB below the rootfs, plus the 508KB of PSRAM above the DTB
+		 * slot that used to be left unused.  The second range starts
+		 * 4KB past 0x11780000 so it can never overlap the bootloader's
+		 * DTB copy, whatever size the DTB grows to.
+		 */
+		reg = <0x11000000 0x700000>, <0x11781000 0x7f000>;
 	};
 
 	cpus {
@@ -47,6 +63,20 @@
 			reg = <0>;
 			device_type = "cpu";
 			compatible = "riscv";
+			/*
+			 * Under-describes the silicon on purpose.  Hazard3 is
+			 * rv32imac_zicsr_zifencei and the kernel is built with
+			 * CONFIG_RISCV_ISA_C=y, but "c" stays out of this list:
+			 * isa-extensions is authoritative (it and isa-base are
+			 * both present, so RISCV_ISA_FALLBACK never applies),
+			 * and "c" is a superset that would also enable zca/zcf/
+			 * zcd.  Their only readers are that superset table and
+			 * KVM, which is disabled, so omitting "c" costs hwcap
+			 * and /proc/cpuisa reporting but no codegen.
+			 *
+			 * "a" is only truthful for on-chip SRAM: AMOs aimed at
+			 * the PSRAM/XIP window fault, hence the rewrite patches.
+			 */
 			riscv,isa = "rv32ima";
 			riscv,isa-base = "rv32i";
 			riscv,isa-extensions = "i", "m", "a";
@@ -60,6 +90,22 @@
 				compatible = "riscv,cpu-intc";
 			};
 		};
+	};
+
+	/*
+	 * Not a PLIC: the RP2350 wires peripheral interrupts straight to the
+	 * hart, handled by irq-simple-intc.c through CSRs.  The driver never
+	 * maps registers, so there is no reg (the previous <0x0 0x0> was a
+	 * bogus zero-length range at physical address 0).  It lives outside
+	 * soc because a reg-less child of a simple-bus makes dtc warn, and
+	 * this is hart-local state rather than an SoC MMIO device.
+	 */
+	plic0: interrupt-controller {
+		interrupts-extended = <&cpu0_intc 11>;
+		interrupt-controller;
+		compatible = "generic,simple-intc";
+		#address-cells = <0x00>;
+		#interrupt-cells = <0x01>;
 	};
 
 	soc {
@@ -84,15 +130,6 @@
 			interrupts = <34>;
 			reg = <0x40078000 0x100>;
 			status = "okay";
-		};
-
-		plic0: interrupt-controller@0 {
-			reg = <0x0 0x0>;
-			interrupts-extended = <&cpu0_intc 11>;
-			interrupt-controller;
-			compatible = "generic,simple-intc";
-			#address-cells = <0x00>;
-			#interrupt-cells = <0x01>;
 		};
 
 		clint: clint@d0000000 {

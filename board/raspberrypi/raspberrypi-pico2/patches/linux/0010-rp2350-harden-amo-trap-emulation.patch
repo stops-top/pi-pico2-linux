@@ -1,0 +1,132 @@
+Subject: [PATCH] rp2350: make the AMO trap emulator fault-safe
+
+The emulator read the instruction word and the AMO target with plain
+dereferences.  do_trap_error() calls it for any SEGV_ACCERR, which includes
+instruction access faults, so an unmapped epc or an unmapped rs1 would fault a
+second time inside the trap handler and panic instead of reporting -EFAULT.
+
+Read both through copy_from_kernel_nofault()/copy_to_kernel_nofault() and
+return 0 on failure so do_trap_error() falls through to fixup_exception() and
+the instruction's own exception-table entry handles it.  Also drop the bogus
+'badaddr += 4': for an access fault badaddr is the faulting address, not the
+PC.  Document that SC.W still always reports success because there is no
+reservation model.
+
+---
+--- a/arch/riscv/kernel/traps.c	2026-11-07 15:50:22.439616776 +0800
++++ b/arch/riscv/kernel/traps.c	2026-11-07 15:53:53.645488417 +0800
+@@ -42,39 +42,66 @@
+ 	return &(((unsigned long*)regs)[offset]);
+ }
+ 
+-static void do_atomic(struct pt_regs *regs){
+-	uint32_t op = *(uint32_t*)regs->epc;
+-	uint32_t irmid = (op>>27)&0x1f;
+-	unsigned long rs1 = *regs_get_register_p(regs,(op >> 15) & 0x1f);
+-	unsigned long rs2 = *regs_get_register_p(regs,(op >> 20) & 0x1f);
+-	unsigned long* rsd = regs_get_register_p(regs,(op >> 7) & 0x1f);
+-	unsigned long* dst = (unsigned long*)rs1;
+-	if((op >> 7) & 0x1f)
+-		*rsd = *dst;
+-	switch( irmid ){
+-		case 0b00010: break; //LR.W
+-		case 0b00011: {
+-			if((op >> 7) & 0x1f)
+-				*rsd = 0;
+-			*dst = rs2;
+-			break; //SC.W (Lie and always say it's good)
+-		}
+-		case 0b00001: *dst = rs2; break; //AMOSWAP.W
+-		case 0b00000: *dst += rs2; break; //AMOADD.W
+-		case 0b00100: *dst ^= rs2; break; //AMOXOR.W
+-		case 0b01100: *dst &= rs2; break; //AMOAND.W
+-		case 0b01000: *dst |= rs2; break; //AMOOR.W
+-		default: break;
++/*
++ * Emulate an AMO/LR/SC that the RP2350 XIP window refused to execute.  Returns
++ * 1 if the instruction was emulated, 0 if the caller must fall back to
++ * fixup_exception()/die().
++ *
++ * access_ok() is unconditionally true on nommu, so rs1 may be any address the
++ * caller made up.  Both the instruction word and the target are therefore read
++ * and written through the fault-safe helpers: a bad address returns 0 here so
++ * the AMO's own exception-table entry can report -EFAULT, instead of faulting
++ * a second time inside the trap handler and panicking.
++ *
++ * There is no reservation model, so SC.W always reports success and LR.W just
++ * loads.  The in-kernel lr/sc sequences are already rewritten by the companion
++ * patches; this path only exists for hand-written userspace atomics, which must
++ * not rely on compare-and-swap semantics.
++ */
++static int do_atomic(struct pt_regs *regs, uint32_t op)
++{
++	uint32_t irmid = (op >> 27) & 0x1f;
++	unsigned long rs1 = *regs_get_register_p(regs, (op >> 15) & 0x1f);
++	unsigned long rs2 = *regs_get_register_p(regs, (op >> 20) & 0x1f);
++	unsigned long *rsd = regs_get_register_p(regs, (op >> 7) & 0x1f);
++	unsigned long *dst = (unsigned long *)rs1;
++	bool write_rd = (op >> 7) & 0x1f;
++	unsigned long old, new;
++
++	if (copy_from_kernel_nofault(&old, dst, sizeof(old)))
++		return 0;
++
++	new = old;
++	switch (irmid) {
++	case 0b00010: break;			/* LR.W */
++	case 0b00011: new = rs2; break;		/* SC.W */
++	case 0b00001: new = rs2; break;		/* AMOSWAP.W */
++	case 0b00000: new = old + rs2; break;	/* AMOADD.W */
++	case 0b00100: new = old ^ rs2; break;	/* AMOXOR.W */
++	case 0b01100: new = old & rs2; break;	/* AMOAND.W */
++	case 0b01000: new = old | rs2; break;	/* AMOOR.W */
++	default: return 0;
+ 	}
+ 
++	if (irmid != 0b00010 && copy_to_kernel_nofault(dst, &new, sizeof(new)))
++		return 0;
++
++	if (write_rd)
++		*rsd = (irmid == 0b00011) ? 0 : old;
++
++	return 1;
+ }
+ 
+-static int do_exinsn(struct pt_regs *regs){
+-	uint32_t op = *(uint32_t*)regs->epc;
+-	switch (op & 0x7f) {
+-		case 0b0101111: do_atomic(regs); return 1;
+-		default: return 0;
+-	}
++static int do_exinsn(struct pt_regs *regs)
++{
++	uint32_t op;
++
++	if (copy_from_kernel_nofault(&op, (uint32_t *)regs->epc, sizeof(op)))
++		return 0;
++	if ((op & 0x7f) != 0b0101111)
++		return 0;
++
++	return do_atomic(regs, op);
+ }
+ 
+ int show_unhandled_signals = 1;
+@@ -180,12 +207,14 @@
+ 	if (user_mode(regs)) {
+ 		do_trap(regs, signo, code, addr);
+ 	} else {
+-		/* If illegal instruction and we can emulate, then
+-		 * we need to emulate and skip the instruction.
++		/*
++		 * The RP2350 raises a store/AMO access fault for atomics aimed
++		 * at the XIP window.  Emulate and skip the instruction only if
++		 * that succeeded; otherwise fall through to the exception table
++		 * so a bad address is reported rather than papered over.
+ 		 */
+-		if(code == SEGV_ACCERR && do_exinsn(regs)){
++		if (code == SEGV_ACCERR && do_exinsn(regs)) {
+ 			regs->epc += 4;
+-			regs->badaddr += 4;
+ 			return;
+ 		}
+ 		if (!fixup_exception(regs))

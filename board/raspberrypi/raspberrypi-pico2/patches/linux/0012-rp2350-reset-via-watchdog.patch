@@ -1,0 +1,85 @@
+Subject: [PATCH] rp2350: reset through the PSM/watchdog instead of spinning
+
+machine_restart() called do_kernel_restart() and then spun forever: this
+platform has no SBI and no watchdog driver, so no restart handler is ever
+registered and 'reboot' from Linux hung the board.
+
+Trigger the RP2350 watchdog directly, following the pico-sdk _watchdog_enable()
+sequence: select every power domain in PSM_WDSEL except ROSC/XOSC, clear
+CTRL.ENABLE and the debug-pause bits, then write the self-clearing CTRL.TRIGGER
+for an immediate reset.  ioremap() is a plain address cast on nommu, so this is
+safe to run after syscore_shutdown().
+
+Also mask interrupts in default_power_off(): the RP2350 is bus powered and has
+no software power-off, so 'poweroff' is a final halt, and leaving interrupts on
+kept the timer and UART running so it looked hung rather than stopped.
+
+---
+--- a/arch/riscv/kernel/reset.c	2026-11-07 15:50:22.446950109 +0800
++++ b/arch/riscv/kernel/reset.c	2026-11-07 15:54:40.166554065 +0800
+@@ -5,9 +5,56 @@
+ 
+ #include <linux/reboot.h>
+ #include <linux/pm.h>
++#include <linux/io.h>
++#include <linux/irqflags.h>
++
++/*
++ * RP2350 PSM/watchdog, from the pico-sdk hardware_regs address map.  The chip
++ * has no SBI and no reset controller driver, so without this machine_restart()
++ * would spin forever after do_kernel_restart() finds no handler.
++ */
++#define RP2350_PSM_BASE			0x40018000
++#define RP2350_PSM_WDSEL		0x08
++#define RP2350_WATCHDOG_BASE		0x400d8000
++#define RP2350_WATCHDOG_CTRL		0x00
++
++#define PSM_WDSEL_ALL			0x01ffffff
++#define PSM_WDSEL_ROSC			0x00000004
++#define PSM_WDSEL_XOSC			0x00000008
++#define WATCHDOG_CTRL_ENABLE		0x40000000
++#define WATCHDOG_CTRL_TRIGGER		0x80000000
++#define WATCHDOG_CTRL_PAUSE_DBG		0x07000000
++
++static void rp2350_reset(void)
++{
++	void __iomem *psm = ioremap(RP2350_PSM_BASE, 0x1000);
++	void __iomem *wdog = ioremap(RP2350_WATCHDOG_BASE, 0x1000);
++	u32 ctrl;
++
++	/* Reset every power domain except the oscillators, as the SDK does. */
++	writel(PSM_WDSEL_ALL & ~(PSM_WDSEL_ROSC | PSM_WDSEL_XOSC),
++	       psm + RP2350_PSM_WDSEL);
++
++	ctrl = readl(wdog + RP2350_WATCHDOG_CTRL);
++	ctrl &= ~(WATCHDOG_CTRL_ENABLE | WATCHDOG_CTRL_PAUSE_DBG);
++	writel(ctrl, wdog + RP2350_WATCHDOG_CTRL);
++
++	/* TRIGGER is self-clearing and resets at once; no tick setup needed. */
++	writel(ctrl | WATCHDOG_CTRL_TRIGGER, wdog + RP2350_WATCHDOG_CTRL);
++
++	iounmap(wdog);
++	iounmap(psm);
++}
+ 
+ static void default_power_off(void)
+ {
++	/*
++	 * RP2350 is USB/bus powered and has no software power-off, so this is a
++	 * final halt.  Mask interrupts first: leaving them on keeps the timer
++	 * and UART alive and looks like a hung system rather than a powered-off
++	 * one.
++	 */
++	local_irq_disable();
+ 	while (1)
+ 		wait_for_interrupt();
+ }
+@@ -18,6 +65,8 @@
+ void machine_restart(char *cmd)
+ {
+ 	do_kernel_restart(cmd);
++	if (IS_ENABLED(CONFIG_ARCH_RP2350))
++		rp2350_reset();
+ 	while (1);
+ }
+ 
